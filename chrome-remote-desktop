@@ -100,8 +100,7 @@ CONFIG_DIR = os.path.join(HOME_DIR, ".config/chrome-remote-desktop")
 SESSION_FILE_PATH = os.path.join(HOME_DIR, ".chrome-remote-desktop-session")
 SYSTEM_SESSION_FILE_PATH = "/etc/chrome-remote-desktop-session"
 
-X_LOCK_FILE_TEMPLATE = "/tmp/.X%d-lock"
-FIRST_X_DISPLAY_NUMBER = 20
+X_DISPLAY_NUMBER = 0
 
 # Amount of time to wait between relaunching processes.
 SHORT_BACKOFF_TIME = 5
@@ -428,15 +427,6 @@ class Desktop:
     assert(g_desktop is None)
     g_desktop = self
 
-  @staticmethod
-  def get_unused_display_number():
-    """Return a candidate display number for which there is currently no
-    X Server lock file"""
-    display = FIRST_X_DISPLAY_NUMBER
-    while os.path.exists(X_LOCK_FILE_TEMPLATE % display):
-      display += 1
-    return display
-
   def _init_child_env(self):
     self.child_env = dict(os.environ)
 
@@ -601,27 +591,11 @@ class Desktop:
       raise Exception("Could not start Xorg.")
     self._wait_for_x()
 
-  def _launch_x_server(self, extra_x_args):
+  def _bind_x_server(self, extra_x_args):
     x_auth_file = os.path.expanduser("~/.Xauthority")
     self.child_env["XAUTHORITY"] = x_auth_file
-    display = self.get_unused_display_number()
 
-    # Run "xauth add" with |child_env| so that it modifies the same XAUTHORITY
-    # file which will be used for the X session.
-    exit_code = subprocess.call("xauth add :%d . `mcookie`" % display,
-                                env=self.child_env, shell=True)
-    if exit_code != 0:
-      raise Exception("xauth failed with code %d" % exit_code)
-
-    # Disable the Composite extension iff the X session is the default
-    # Unity-2D, since it uses Metacity which fails to generate DAMAGE
-    # notifications correctly. See crbug.com/166468.
-    x_session = choose_x_session()
-    if (len(x_session) == 2 and
-        x_session[1] == "/usr/bin/gnome-session --session=ubuntu-2d"):
-      extra_x_args.extend(["-extension", "Composite"])
-
-    self.child_env["DISPLAY"] = ":%d" % display
+    self.child_env["DISPLAY"] = ":%d" % X_DISPLAY_NUMBER
     self.child_env["CHROME_REMOTE_DESKTOP_SESSION"] = "1"
 
     # Use a separate profile for any instances of Chrome that are started in
@@ -634,94 +608,14 @@ class Desktop:
     if self.ssh_auth_sockname:
       self.child_env["SSH_AUTH_SOCK"] = self.ssh_auth_sockname
 
-    if USE_XORG_ENV_VAR in os.environ:
-      self._launch_xorg(display, x_auth_file, extra_x_args)
-    else:
-      self._launch_xvfb(display, x_auth_file, extra_x_args)
-
-    # The remoting host expects the server to use "evdev" keycodes, but Xvfb
-    # starts configured to use the "base" ruleset, resulting in XKB configuring
-    # for "xfree86" keycodes, and screwing up some keys. See crbug.com/119013.
-    # Reconfigure the X server to use "evdev" keymap rules.  The X server must
-    # be started with -noreset otherwise it'll reset as soon as the command
-    # completes, since there are no other X clients running yet.
-    exit_code = subprocess.call(["setxkbmap", "-rules", "evdev"],
-                                env=self.child_env)
-    if exit_code != 0:
-      logging.error("Failed to set XKB to 'evdev'")
-
     if not self.server_supports_randr:
       return
-
-    with open(os.devnull, "r+") as devnull:
-      # Register the screen sizes with RandR, if needed.  Errors here are
-      # non-fatal; the X server will continue to run with the dimensions from
-      # the "-screen" option.
-      if self.randr_add_sizes:
-        for width, height in self.sizes:
-          label = "%dx%d" % (width, height)
-          args = ["xrandr", "--newmode", label, "0", str(width), "0", "0", "0",
-                  str(height), "0", "0", "0"]
-          subprocess.call(args, env=self.child_env, stdout=devnull,
-                          stderr=devnull)
-          args = ["xrandr", "--addmode", "screen", label]
-          subprocess.call(args, env=self.child_env, stdout=devnull,
-                          stderr=devnull)
-
-      # Set the initial mode to the first size specified, otherwise the X server
-      # would default to (max_width, max_height), which might not even be in the
-      # list.
-      initial_size = self.sizes[0]
-      label = "%dx%d" % initial_size
-      args = ["xrandr", "-s", label]
-      subprocess.call(args, env=self.child_env, stdout=devnull, stderr=devnull)
-
-      # Set the physical size of the display so that the initial mode is running
-      # at approximately 96 DPI, since some desktops require the DPI to be set
-      # to something realistic.
-      args = ["xrandr", "--dpi", "96"]
-      subprocess.call(args, env=self.child_env, stdout=devnull, stderr=devnull)
-
-      # Monitor for any automatic resolution changes from the desktop
-      # environment.
-      args = [SCRIPT_PATH, "--watch-resolution", str(initial_size[0]),
-              str(initial_size[1])]
-
-      # It is not necessary to wait() on the process here, as this script's main
-      # loop will reap the exit-codes of all child processes.
-      subprocess.Popen(args, env=self.child_env, stdout=devnull, stderr=devnull)
-
-  def _launch_x_session(self):
-    # Start desktop session.
-    # The /dev/null input redirection is necessary to prevent the X session
-    # reading from stdin.  If this code runs as a shell background job in a
-    # terminal, any reading from stdin causes the job to be suspended.
-    # Daemonization would solve this problem by separating the process from the
-    # controlling terminal.
-    xsession_command = choose_x_session()
-    if xsession_command is None:
-      raise Exception("Unable to choose suitable X session command.")
-
-    logging.info("Launching X session: %s" % xsession_command)
-    self.session_proc = subprocess.Popen(xsession_command,
-                                         stdin=open(os.devnull, "r"),
-                                         stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT,
-                                         cwd=HOME_DIR,
-                                         env=self.child_env)
-
-    output_filter_thread = SessionOutputFilterThread(self.session_proc.stdout)
-    output_filter_thread.start()
-
-    if not self.session_proc.pid:
-      raise Exception("Could not start X session")
 
   def launch_session(self, x_args):
     self._init_child_env()
     self._setup_pulseaudio()
     self._setup_gnubby()
-    self._launch_x_server(x_args)
-    self._launch_x_session()
+    self._bind_x_server(x_args)
 
   def launch_host(self, host_config, extra_start_host_args):
     # Start remoting host
